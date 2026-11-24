@@ -1,0 +1,23 @@
+#!name=MyAPI签到
+#!desc=每日自动签到，查看奖励、余额与累计消耗。目标站 https://myapi.286600.xyz（New-API）。改编自 MaYIHEI paperclip 的 AgentRouter 签到。
+#!author=Muse，改编自 MaYIHEI / @773075692
+#!homepage=https://myapi.286600.xyz
+#!arguments=username,password
+#!arguments-desc=在模块的「编辑参数」里填写 MyAPI 账号（用户名或邮箱）和密码，安装模块时或之后点开模块都能改，不用改文件。密码里如果有 & 请写成 %26，有 = 请写成 %3D。
+
+# 使用前必读（见 README.md）：
+# 1. 脚本地址已指向本仓库的 myapi.js：
+#    https://raw.githubusercontent.com/JiuYueQingCheng/myapi-surge-checkin/main/myapi.js
+#    直接导入本模块即可，不用改 script-path。
+# 2. 账号密码不在文件里填：导入模块后，在 Surge 模块列表里点开「MyAPI签到」→ 编辑参数，
+#    填 username（MyAPI 用户名或邮箱）和 password（网站登录密码）并保存。
+#    本站没有 GitHub 登录，NODELOC / Passkey 无法在定时任务里完成，
+#    所以只能用账号密码登录（本站 /api/status 确认 password_login_enabled=true）。
+# 3. 启用模块后每天 09:00 自动运行。
+#
+# 注意：模块参数表需要较新版 Surge（Mac 5.5.0+ 起支持，iOS 也需较新版）。
+# 旧版 Surge 会忽略 #!arguments，那时仍需直接改下面 argument= 里的账号密码，
+# 或改用 BoxJS（填 myapi_username、myapi_password）。
+
+[Script]
+MyAPI签到 = type=cron,cronexp="0 9 * * *",script-path=https://raw.githubusercontent.com/JiuYueQingCheng/myapi-surge-checkin/main/myapi.js,argument=username={{{username}}}&password={{{password}}},timeout=60,wake-system=true

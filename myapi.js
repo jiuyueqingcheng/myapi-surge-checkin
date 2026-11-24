@@ -1,0 +1,511 @@
+/**
+ * MyAPI · 每日登录签到，查看奖励、余额与累计消耗
+ *
+ * 目标站：https://myapi.286600.xyz
+ * （New-API v1.0.0-rc.36，/api/status 已验证：checkin_enabled=true，
+ *  display_in_currency=true，quota_per_unit=500000，password_login_enabled=true，
+ *  github_oauth=false，linuxdo_oauth=false，仅 NODELOC 第三方登录）
+ *
+ * 原理：与 AgentRouter 相同，都是 New-API。登录即签到：
+ *   POST /api/user/login {username, password}
+ *     -> data.id、data.checked_in、Set-Cookie: session=...
+ *   GET  /api/user/self   （Cookie: session=...，New-API-User: <id>）
+ *     -> data.quota、data.used_quota、data.request_count
+ *   GET  /api/log/self?p=1&page_size=20
+ *     -> 找当天 type=4、内容含“签到成功”的记录，确认奖励
+ *   GET  /api/status
+ *     -> display_in_currency / quota_per_unit，用于把额度换算成美元
+ *
+ * 账号填写（三选一，优先 $argument）：
+ *   1. Surge 模块参数（推荐）：myapi.sgmodule 里用 #!arguments 声明了
+ *      username、password，导入模块后在 Surge「编辑参数」里填写，
+ *      模块会把它们拼成 argument=username=...&password=... 传给脚本。
+ *      密码里有 & 请写成 %26，有 = 请写成 %3D（脚本会解码回来）。
+ *   2. Surge 脚本的 argument 参数（字符串）：
+ *        argument=username=你的账号&password=你的密码
+ *      或 JSON：
+ *        argument={"username":"你的账号","password":"你的密码"}
+ *      多账号 JSON：
+ *        argument={"accounts":[{"username":"a","password":"p1"},{"username":"b","password":"p2"}]}
+ *   3. BoxJS / $persistentStore：
+ *        myapi_username、myapi_password
+ *      多账号时在 BoxJS 填 myapi_accounts（JSON 数组，同上格式）。
+ *
+ * 注意：本站没有 GitHub 登录入口，NODELOC / Passkey 需要浏览器交互，
+ * 无法在 Surge 定时任务里完成，所以本脚本只能用账号密码登录。
+ * 请勿把账号密码发到聊天或公开仓库，只填在 Surge / BoxJS 本地。
+ *
+ * 签到：cron 每天 09:00 自动运行，结果未确认时请到网站核对。
+ *
+ * 改编自：MaYIHEI paperclip app/agentrouter
+ *   https://github.com/MaYIHEI/paperclip/tree/main/app/agentrouter
+ *   原作者 @773075692，改编者 MaYIHEI
+ * 本版改编：Muse，按 https://myapi.286600.xyz 的 /api/status 适配
+ *
+ * ===== Surge =====
+ * [Script]
+ * MyAPI签到 = type=cron,cronexp="0 9 * * *",timeout=60,script-path=https://raw.githubusercontent.com/你的仓库/myapi.js,argument=username=你的账号&password=你的密码
+ * 也可以直接用随附的 myapi.sgmodule 导入 Surge（见 README.md）。
+ *
+ * ===== Loon / Quantumult X / Stash =====
+ * 与 AgentRouter 原脚本用法相同，把 BASE_URL 和键名换成本文件即可，
+ * Loon 的 $argument 是对象，Quantumult X / Stash 用 BoxJS 填账号。
+ */
+
+const $ = new Env("MyAPI");
+
+// 签到合集开启「统一通知」时不单独弹通知，结果由签到汇总统一发送
+$.merge = typeof $argument === "object" && !!$argument && $argument.merge === true;
+
+if ($.merge) $.msg = (...a) => console.log(a.filter((x) => typeof x === "string" && x).join("\n"));
+
+const SCRIPT_VERSION = "2026-11-25.r1";
+
+$.log(`[INFO] 脚本版本 ${SCRIPT_VERSION}`);
+
+const USER_KEY = "myapi_username";
+const PASSWORD_KEY = "myapi_password";
+const ACCOUNTS_KEY = "myapi_accounts";
+const CLEAR_KEY = "myapi_clear";
+const DEBUG_KEY = "myapi_debug";
+
+const IS_LOON = $.isLoon();
+
+// $argument 在 Surge 里是字符串，在 Loon 里是对象，在 QX/Stash 里不存在。
+// 统一解析成对象，解析失败时当作空对象。
+const PLUGIN = parseArgument(typeof $argument !== "undefined" ? $argument : null);
+
+const SETTINGS_PAGE = IS_LOON ? "Loon 插件设置或 BoxJS" : "BoxJS / Surge 模块 argument";
+
+const BASE_URL = "https://myapi.286600.xyz";
+
+const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1";
+
+run().catch((error) => {
+    // 只输出脚本主动生成的错误，不转储账号、请求和原始响应。
+    saveStatus("fail", error.message);
+    $.msg($.name, "❌ 运行失败", error.message);
+}).finally(() => $.done());
+
+function parseArgument(raw) {
+    if (!raw) return {};
+    if (typeof raw === "object") return raw;
+    if (typeof raw !== "string") return {};
+    const text = raw.trim();
+    if (!text) return {};
+    // JSON：{"username":"...","password":"..."} 或 {"accounts":[...]}
+    if (text.startsWith("{")) {
+        try { return JSON.parse(text); } catch (_) { return {}; }
+    }
+    // 查询串：username=...&password=...&debug=true
+    const out = {};
+    for (const part of text.split("&")) {
+        const eq = part.indexOf("=");
+        if (eq <= 0) continue;
+        const k = decodeURIComponent(part.slice(0, eq).trim());
+        const v = decodeURIComponent(part.slice(eq + 1).trim());
+        if (k) out[k] = v;
+    }
+    return out;
+}
+
+async function run() {
+    const clear = $.getdata(CLEAR_KEY);
+
+    if (clear === "true" || clear === "1") {
+        const userCleared = $.setdata("", USER_KEY);
+        const passwordCleared = $.setdata("", PASSWORD_KEY);
+        if (!userCleared || !passwordCleared) {
+            throw new Error("账号信息清除失败，请在 BoxJS 中检查并手动清空");
+        }
+        $.setdata("false", CLEAR_KEY);
+        $.msg($.name, "✅ 账号信息已清除", "需要继续签到时，请在 BoxJS 重新填写账号和密码");
+        return;
+    }
+
+    const accounts = readAccounts();
+
+    if (!accounts.length) {
+        saveStatus("none", "未配置账号");
+        $.msg($.name, "🚫 未配置账号", `请在 ${SETTINGS_PAGE} 的 MyAPI 中分别填写账号和密码并保存`);
+        return;
+    }
+
+    let quotaUnit = null;
+
+    try {
+        const status = await request("GET", "/api/status", { Accept: "application/json" }, undefined, "余额显示配置查询");
+        const config = status.json.data;
+        if (status.json.success === true && config && config.display_in_currency === true
+            && typeof config.quota_per_unit === "number" && Number.isFinite(config.quota_per_unit) && config.quota_per_unit > 0) {
+            quotaUnit = config.quota_per_unit;
+        }
+    } catch (_) {
+        debug("余额显示配置未取得，将显示原始额度");
+    }
+
+    const results = [];
+
+    for (let i = 0; i < accounts.length; i++) {
+        debug(`开始账号 ${i + 1}/${accounts.length}`);
+        try {
+            results.push(await checkin(accounts[i], quotaUnit));
+        } catch (error) {
+            results.push({ title: "❌ 运行失败", content: error.message });
+        }
+    }
+
+    // 登录失败 = 账号密码需要更新，对应体检里的「需重新抓取」
+    const loginFailed = results.some((result) => result.title === "❌ 登录失败");
+    const failed = results.find((result) => result.title === "❌ 运行失败");
+
+    if (loginFailed) saveStatus("cookie", "登录失败,请检查账号密码");
+    else if (failed) saveStatus("fail", failed.content);
+    else saveStatus("ok", results.map((result) => result.content.split("\n")[0].replace(/^🎁\s*/, "")).join(" · "), results.length === 1 ? results[0].balance : undefined); // 多账号不合并余额
+
+    if (results.length === 1) {
+        $.msg($.name, results[0].title, `👤 账号：${maskAccount(accounts[0].username)}\n${results[0].content}`);
+    } else {
+        $.msg($.name, `签到汇总（${results.length} 个账号）`, results.map((result, i) =>
+            `👤 账号 ${i + 1} · ${maskAccount(accounts[i].username)}\n${result.title}\n${result.content}`).join("\n\n"));
+    }
+}
+
+function readAccounts() {
+    // 1. $argument（Surge 字符串 / Loon 对象）里的多账号
+    const multi = PLUGIN.accounts;
+    if (multi) {
+        let accounts;
+        if (typeof multi === "string") {
+            try { accounts = JSON.parse(multi); } catch (_) {
+                throw new Error("多账号格式错误，请按使用说明填写 JSON 数组");
+            }
+        } else {
+            accounts = multi;
+        }
+        if (!Array.isArray(accounts) || !accounts.length) {
+            throw new Error("多账号必须是非空 JSON 数组；使用单账号时请清空多账号输入框");
+        }
+        return accounts.map((account, i) => {
+            if (!account || typeof account.username !== "string" || !account.username.trim()
+                || typeof account.password !== "string" || !account.password) {
+                throw new Error(`多账号第 ${i + 1} 项缺少有效的 username 或 password，请检查插件设置`);
+            }
+            return { username: account.username.trim(), password: account.password };
+        });
+    }
+
+    // 2. BoxJS 里存的多账号
+    const storedMulti = $.getdata(ACCOUNTS_KEY);
+    if (storedMulti) {
+        try {
+            const accounts = JSON.parse(storedMulti);
+            if (Array.isArray(accounts) && accounts.length) {
+                return accounts.map((account, i) => {
+                    if (!account || typeof account.username !== "string" || !account.username.trim()
+                        || typeof account.password !== "string" || !account.password) {
+                        throw new Error(`多账号第 ${i + 1} 项缺少有效的 username 或 password`);
+                    }
+                    return { username: account.username.trim(), password: account.password };
+                });
+            }
+        } catch (e) {
+            if (e.message && e.message.includes("多账号第")) throw e;
+            throw new Error("BoxJS 多账号格式错误，请填写 JSON 数组");
+        }
+    }
+
+    // 3. 单账号：$argument 优先，其次 BoxJS / $persistentStore
+    const username = (PLUGIN.username || $.getdata(USER_KEY) || "").trim();
+    const password = PLUGIN.password || $.getdata(PASSWORD_KEY) || "";
+
+    return username && password ? [{ username, password }] : [];
+}
+
+async function checkin({ username, password }, quotaUnit) {
+    const headers = {
+        "User-Agent": UA,
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        Origin: BASE_URL,
+        Referer: `${BASE_URL}/login`,
+    };
+
+    const loginStarted = Math.floor(Date.now() / 1000);
+
+    const login = await request("POST", "/api/user/login", headers, JSON.stringify({ username, password }), "登录");
+
+    const loginFinished = Math.floor(Date.now() / 1000);
+
+    if (login.json.success !== true) {
+        return { title: "❌ 登录失败", content: `请先在 MyAPI 网页确认账号、密码及是否需要验证码，再更新 ${SETTINGS_PAGE}` };
+    }
+
+    const data = login.json.data;
+
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+        return { title: "⚠️ 签到待确认", content: "登录成功，但响应缺少用户信息，请到网站使用日志中核对" };
+    }
+
+    debug(`登录成功；checked_in=${data.checked_in === true ? "true" : data.checked_in === false ? "false" : "缺失或格式异常"}`);
+
+    const cookie = sessionCookie(login.headers);
+
+    if (!cookie || !Number.isInteger(data.id) || data.id <= 0) {
+        return { title: "⚠️ 签到待确认", content: "登录响应缺少 Cookie 或用户编号，请到网站核对签到记录与余额" };
+    }
+
+    const userHeaders = {
+        ...headers,
+        Referer: `${BASE_URL}/console`,
+        Cookie: cookie,
+        "New-API-User": String(data.id),
+    };
+
+    let stats, balance;
+
+    try {
+        const profile = await request("GET", "/api/user/self", userHeaders, undefined, "余额查询");
+        const quota = profile.json.data && profile.json.data.quota;
+
+        if (profile.json.success !== true || typeof quota !== "number" || !Number.isFinite(quota)) {
+            throw new Error("余额查询未返回有效额度，请到网站核对");
+        }
+
+        const user = profile.json.data;
+        stats = `${formatAmount("💳 当前余额", quota, quotaUnit)}\n${formatAmount("📉 累计消耗", user.used_quota, quotaUnit)}`;
+        balance = quotaUnit === null ? `额度 ${quota}` : `余额 $${(quota / quotaUnit).toFixed(2)}`;
+
+        if (Number.isInteger(user.request_count) && user.request_count >= 0) {
+            stats += `\n⚡ 累计调用：${user.request_count} 次`;
+        }
+    } catch (error) {
+        stats = `💳 当前余额：查询失败\n📉 累计消耗：查询失败\n${error.message}`;
+    }
+
+    let checkinRecord = null;
+    let detail;
+
+    try {
+        const logs = await request("GET", "/api/log/self?p=1&page_size=20", {
+            ...userHeaders,
+            Referer: `${BASE_URL}/console/log`,
+        }, undefined, "签到记录查询");
+
+        if (logs.json.success !== true || !logs.json.data || !Array.isArray(logs.json.data.items)) {
+            throw new Error("签到记录查询未成功，请在网站使用日志中核对");
+        }
+
+        const items = logs.json.data.items;
+        checkinRecord = findTodayCheckin(items, Date.now());
+        debug(`最近记录数=${items.length}；今日签到记录=${!!checkinRecord}`);
+
+        if (!checkinRecord) detail = "最近 20 条日志中未找到今日签到记录，请到网站核对";
+    } catch (error) {
+        detail = error.message;
+    }
+
+    if (checkinRecord) {
+        const time = new Date(checkinRecord.created_at * 1000);
+        const clock = [time.getHours(), time.getMinutes(), time.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
+
+        // 新增标记与本次登录期间的记录同时成立，才将奖励归于本次运行。
+        const isNew = data.checked_in === true && checkinRecord.created_at >= loginStarted && checkinRecord.created_at <= loginFinished;
+        const reward = formatCheckinReward(checkinRecord.content, isNew, quotaUnit);
+
+        return { title: "✅ 今日签到已确认", content: `${reward}\n${stats}\n🕒 签到时间：${clock}`, balance };
+    } else {
+        const state = data.checked_in === true ? "服务端返回已签到，但日志尚未确认" : "登录成功，签到状态尚未确认";
+        return { title: "⚠️ 签到待确认", content: `🎁 签到奖励：待确认\n${stats}\n\n${state}\n${detail}`, balance };
+    }
+}
+
+// 记录本次结果，供「签到汇总」：ok 正常 / cookie 需重新抓取 / fail 其他失败 / none 未使用
+function saveStatus(s, msg, asset) {
+    msg = String(msg).slice(0, 100);
+
+    // 服务器明确提示登录过期的失败，按需要重新抓取处理
+    if (s === "fail" && /过期|重新登录|未登录|请登录|登录失效|登录已失效|token\s*(失效|过期|无效)|not\s*login/i.test(msg)) s = "cookie";
+
+    // 同一天已有带奖励的成功记录时，再次运行得到的「今日已签」不覆盖它的奖励文字，只合并本次的资产等信息
+    let keep = null;
+
+    if (s === "ok" && /^今日已/.test(msg)) {
+        const day = (t) => new Date(t + 8 * 3600 * 1000).toISOString().slice(0, 10);
+        let old = null;
+        try { old = JSON.parse($.getdata("myapi_status") || "null"); } catch (e) {}
+        if (old && old.s === "ok" && !/^今日已/.test(old.msg) && day(old.t) === day(Date.now())) keep = old;
+    }
+
+    checkinReport("myapi_status", keep ? keepReward(keep, { s, msg, asset }) : { s, msg, asset }, { name: "MyAPI", author: "Muse" });
+}
+
+function maskAccount(username) {
+    const name = username.split("@")[0];
+    return name.length > 4 ? `${name.slice(0, 2)}***${name.slice(-2)}` : `${name.slice(0, 1)}***`;
+}
+
+function formatAmount(label, value, quotaUnit) {
+    if (typeof value !== "number" || !Number.isFinite(value)) return `${label}：未返回`;
+    return quotaUnit === null ? `${label}（原始额度）：${value}` : `${label}：$${(value / quotaUnit).toFixed(2)}`;
+}
+
+function formatCheckinReward(content, isNew, quotaUnit) {
+    // 系统日志的 quota 不是奖励；只解析实测详情中明确标注的美元金额
+    // （官网半角 $、全角 ＄ 都出现过）。
+    // MyAPI 的奖励格式未经实测确认：先按 AgentRouter 的格式解析，
+    // 若本站返回的是原始额度数字，再按 quota_per_unit 换算成美元。
+    const text = (content || "").trim();
+    const match = text.match(/^每日签到成功，\s*增加额度\s*[$＄]\s*(\d+(?:\.\d+)?)\s*额度$/);
+    const amount = match ? Number(match[1]) : NaN;
+    const label = isNew ? "🎁 本次奖励" : "🎁 今日奖励";
+    if (Number.isFinite(amount)) {
+        return `${label}：${amount > 0 ? "+" : ""}$${amount.toFixed(2)}${isNew ? "" : "（今日记录）"}`;
+    }
+    const rawMatch = text.match(/^每日签到成功，\s*增加额度\s*(\d+(?:\.\d+)?)\s*额度$/);
+    if (rawMatch && quotaUnit) {
+        const raw = Number(rawMatch[1]);
+        if (Number.isFinite(raw) && raw > 0) {
+            return `${label}：+$${(raw / quotaUnit).toFixed(2)}（原始额度 ${raw}）${isNew ? "" : "（今日记录）"}`;
+        }
+    }
+    return `${label}：金额未识别，请到网站核对（原始记录：${text.slice(0, 60)}）`;
+}
+
+function findTodayCheckin(items, now) {
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+    let latest = null;
+    for (const item of items) {
+        if (item && item.type === 4
+            && typeof item.content === "string" && item.content.includes("签到成功")
+            && typeof item.created_at === "number" && Number.isFinite(item.created_at)
+            && item.created_at * 1000 >= start.getTime() && item.created_at * 1000 <= now
+            && (!latest || item.created_at > latest.created_at)) latest = item;
+    }
+    return latest;
+}
+
+function sessionCookie(headers) {
+    const key = Object.keys(headers).find((name) => name.toLowerCase() === "set-cookie");
+    const raw = key ? [].concat(headers[key]).join("\n") : "";
+    // 仅复用 session；不把 Expires 中的逗号或其他 Set-Cookie 属性当作 Cookie。
+    const match = raw.match(/(?:^|[\n,])\s*(?:set-cookie:\s*)?(session=[^;\s,]+)/i);
+    return match ? match[1] : "";
+}
+
+function request(method, path, headers, body, label) {
+    return new Promise((resolve, reject) => {
+        const options = { url: BASE_URL + path, headers };
+        if (body !== undefined) options.body = body;
+
+        // 账号密码只发给固定 HTTPS 站点；Loon 默认允许不受信任证书，需显式关闭。
+        if ($.isLoon()) {
+            options.insecure = false;
+            options["auto-redirect"] = false;
+            // 每个账号只使用本次登录拿到的 session，禁止 Cookie 自动沿用到下一个账号。
+            options["auto-cookie"] = false;
+        }
+
+        $.send(options, method, (error, response, text) => {
+            if (error) {
+                reject(new Error(`${label}网络请求失败，请检查该网站的 Surge 分流或稍后重试`));
+                return;
+            }
+
+            const status = Number(response && (response.status || response.statusCode));
+            debug(`${label} HTTP ${status}`);
+
+            if (status < 200 || status >= 300 || !status) {
+                reject(new Error(`${label}返回 HTTP ${status || "未知"}，请在浏览器确认网站是否可访问或需要验证`));
+                return;
+            }
+
+            let json;
+            try {
+                json = JSON.parse(text);
+            } catch (_) {
+                reject(new Error(`${label}返回非 JSON 内容，可能是网页验证或服务异常，请到网站检查`));
+                return;
+            }
+
+            if (!json || typeof json !== "object" || Array.isArray(json)) {
+                reject(new Error(`${label}响应格式异常，请到网站检查`));
+                return;
+            }
+
+            resolve({ json, headers: response.headers || {} });
+        });
+    });
+}
+
+function debug(message) {
+    if (PLUGIN.debug === true || PLUGIN.debug === "true" || $.getdata(DEBUG_KEY) === "true") $.log(`[DEBUG] ${message}`);
+}
+
+// 保留当天带奖励的旧记录（状态、奖励文字、时间），合并本次拿到的资产、过期时间等；本次没有的沿用旧值
+function keepReward(old, rec) {
+    const out = { s: old.s, msg: old.msg, t: old.t, asset: old.asset, exp: old.exp };
+    for (const k in rec) if (rec[k] !== undefined && k !== "s" && k !== "msg") out[k] = rec[k];
+    return out;
+}
+
+// 签到状态协议 v1：写本次结果，并把自己登记进公共索引 checkin_registry（Loon/Surge/QX/Stash 通用，不依赖 Env）
+function checkinReport(key, rec, info) {
+    const read = (k) => (typeof $prefs !== "undefined" ? $prefs.valueForKey(k) : $persistentStore.read(k));
+    const write = (v, k) => (typeof $prefs !== "undefined" ? $prefs.setValueForKey(v, k) : $persistentStore.write(v, k));
+    const registry = () => { try { return JSON.parse(read("checkin_registry") || "{}") || {}; } catch (e) { return {}; } };
+    write(JSON.stringify(Object.assign({ v: 1, t: Date.now(), name: info.name, author: info.author }, rec)), key);
+    const reg = registry();
+    if (JSON.stringify(reg[key]) === JSON.stringify(info)) return;
+    reg[key] = info;
+    write(JSON.stringify(reg), "checkin_registry");
+    if (!registry()[key]) console.log(`[checkin] ${key} 登记没写上，下次运行再补`);
+}
+
+function Env(s) {
+    this.name = s;
+    this.isSurge = () => typeof $httpClient !== "undefined";
+    this.isQuanX = () => typeof $task !== "undefined";
+    this.isLoon = () => typeof $loon !== "undefined";
+    this.log = (...a) => console.log(a.join("\n"));
+    this.msg = (t = this.name, s = "", b = "") => {
+        if (this.isSurge() || this.isLoon()) $notification.post(t, s, b);
+        else if (this.isQuanX()) $notify(t, s, b);
+        console.log(["", `====📣${t}====`, s, b].filter(Boolean).join("\n"));
+    };
+    this.getdata = (k) => {
+        if (this.isSurge() || this.isLoon()) return $persistentStore.read(k);
+        if (this.isQuanX()) return $prefs.valueForKey(k);
+        return null;
+    };
+    this.setdata = (v, k) => {
+        if (this.isSurge() || this.isLoon()) return $persistentStore.write(v, k);
+        if (this.isQuanX()) return $prefs.setValueForKey(v, k);
+        return false;
+    };
+    this.send = (req, method, cb) => {
+        if (this.isSurge() || this.isLoon()) {
+            const fn = method === "POST" ? $httpClient.post : $httpClient.get;
+            fn(req, (err, resp, data) => {
+                if (resp) {
+                    resp.body = data;
+                    resp.statusCode = resp.status || resp.statusCode;
+                }
+                cb(err, resp, data);
+            });
+        } else if (this.isQuanX()) {
+            req.method = method;
+            $task.fetch(req).then(
+                (r) => {
+                    r.status = r.statusCode;
+                    cb(null, r, r.body);
+                },
+                (e) => cb(e.error || e, null, null),
+            );
+        }
+    };
+    this.done = (v = {}) => {
+        if (typeof $done !== "undefined") $done(v);
+    };
+}
