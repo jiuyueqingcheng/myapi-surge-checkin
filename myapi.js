@@ -35,7 +35,9 @@
  * 无法在 Surge 定时任务里完成，所以本脚本只能用账号密码登录。
  * 请勿把账号密码发到聊天或公开仓库，只填在 Surge / BoxJS 本地。
  *
- * 签到：cron 每天 09:00 自动运行，结果未确认时请到网站核对。
+ * 签到：cron 每天在模块参数设定的时间自动运行（默认 09:00）。
+ * 时间在 myapi.sgmodule 的「编辑参数」里改：checkin_hour（0-23，默认 9）、
+ * checkin_minute（0-59，默认 0），例如 8 点 30 分就填 8 和 30。结果未确认时请到网站核对。
  *
  * 改编自：MaYIHEI paperclip app/agentrouter
  *   https://github.com/MaYIHEI/paperclip/tree/main/app/agentrouter

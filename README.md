@@ -48,8 +48,10 @@ MyAPI 和 AgentRouter 都是 New-API，接口完全相同，登录即签到：
 
 - `username` —— MyAPI 的用户名或邮箱
 - `password` —— 网站登录密码
+- `checkin_hour` —— 每天签到的小时，0-23，默认 9
+- `checkin_minute` —— 每天签到的分钟，0-59，默认 0
 
-填好保存即可。模块会把它们拼成 `argument=username=…&password=…` 传给脚本，`myapi.js` 本身不用改，`myapi.sgmodule` 里也不用写明文账号密码。
+填好保存即可。模块会把它们拼成 `argument=username=…&password=…` 传给脚本，并把时间拼成 `cronexp="分 时 * * *"`，`myapi.js` 本身不用改，`myapi.sgmodule` 里也不用写明文账号密码。
 
 - 密码里如果有 `&`，请写成 `%26`；有 `=`，请写成 `%3D`（脚本收到后会解码回来）。其他字符不用转义。
 - 多账号：模块参数只支持单账号；多账号请改用下面的 BoxJS 方式，或直接改 `myapi.sgmodule` 里 `argument=` 行为 JSON：`argument={"accounts":[{"username":"a","password":"p1"},{"username":"b","password":"p2"}]}`。
@@ -62,8 +64,17 @@ MyAPI 和 AgentRouter 都是 New-API，接口完全相同，登录即签到：
 ### 3. 导入 Surge
 
 - 把改好的 `myapi.sgmodule` 传到一个可访问的 URL（同样可放 GitHub），在 Surge 里「模块 → 安装模块」粘贴该 URL；或用 Surge 的本地模块导入。
-- 启用后每天 **09:00** 自动运行（`cronexp="0 9 * * *"`），想改时间就改这一行。
+- 启用后每天在设定时间自动运行（默认 **09:00**），想改时间就改这一行。
 - 也可以在 Surge 脚本列表里长按「MyAPI签到」手动立即运行一次，看通知结果。
+
+### 改签到时间
+
+不用改文件：在 Surge 模块列表里点开「MyAPI签到」→ **编辑参数**，改：
+
+- `checkin_hour` —— 小时，0-23，默认 9
+- `checkin_minute` —— 分钟，0-59，默认 0
+
+例如每天 08:30 签到，就填 `checkin_hour` = 8、`checkin_minute` = 30。保存后模块重新应用，下次就按新时间跑。
 
 ## 运行结果
 
