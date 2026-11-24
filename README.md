@@ -5,21 +5,31 @@
 
 ## 原理
 
-MyAPI 和 AgentRouter 都是 New-API，接口完全相同，登录即签到：
+MyAPI 是新版 New-API（v1.0.0-rc.36），登录和签到方式与 AgentRouter 的老版本**不一样**：
 
 | 步骤 | 请求 |
 |---|---|
 | 查余额显示配置 | `GET /api/status` → `display_in_currency`、`quota_per_unit` |
-| 登录（= 签到） | `POST /api/user/login` `{"username","password"}` → `data.id`、`data.checked_in`、Set-Cookie `session=` |
-| 查余额 | `GET /api/user/self`（带 `Cookie: session=…` 和 `New-API-User: <id>`）→ `quota`、`used_quota`、`request_count` |
-| 确认签到记录 | `GET /api/log/self?p=1&page_size=20` → 找当天 `type=4`、内容含“签到成功”的记录 |
+| 登录 | `POST /api/user/login` `{"username","password"}` → `data: {access_token, user: {id, username, quota, …}}` |
+| 之后所有请求带 | `Authorization: Bearer <access_token>` + `New-API-User: <user_id>` |
+| 查余额 | `GET /api/user/self` → `quota`、`used_quota`、`request_count` |
+| 查今日签到状态 | `GET /api/user/checkin?month=YYYY-MM` → `stats.checked_in_today`、`stats.records`（含 `checkin_date`、`quota_awarded`） |
+| 签到 | `POST /api/user/checkin` → 成功返回 `data: {quota_awarded, checkin_date}`；今日已签过返回 `Already checked in today` |
+
+关键区别：
+
+- 新版登录**不再返回**顶层 `data.id` / `data.checked_in`，也不发 `session` Cookie，改发 Bearer `access_token`。v1 版本的脚本按老格式解析，才会报“登录响应缺少 Cookie 或用户编号”。
+- 新版登录本身**不再自动签到**，必须显式调 `POST /api/user/checkin`。今天已签到过时，脚本先查状态确认，不重复 POST，直接显示今日奖励。
+
+流程：登录 → 查余额 → 查今日签到状态 → 未签到则 POST 签到 → 再查一次余额（奖励已入账）。
 
 本站 `/api/status` 已实测验证（2026-11-25）：
 
 - `checkin_enabled: true` —— 确实有每日签到
-- `display_in_currency: true`，`quota_per_unit: 500000` —— 余额按 `$ = 额度 / 500000` 显示
+- `display_in_currency: true`，`quota_per_unit: 500000` —— 余额按 `$ = 额度 / 500000` 显示，签到奖励（原始额度）同样换算
 - `password_login_enabled: true` —— 账号密码登录可用
 - `github_oauth: false`，`linuxdo_oauth: false` —— **没有 GitHub 登录**
+- `turnstile_check: false` —— 签到接口不需要 Turnstile 票据
 - 第三方登录只有 NODELOC，另有 Passkey —— 两者都需要浏览器交互，**无法在 Surge 定时任务里完成**
 
 所以本模块只能用**账号密码**登录签到。如果你是在 MyAPI 上用 NODELOC 注册的账号、没有设置过密码，请先在网站「个人设置」里设置一个密码，再填到模块里。
@@ -87,9 +97,8 @@ MyAPI 和 AgentRouter 都是 New-API，接口完全相同，登录即签到：
 
 ## 未验证的部分（实话）
 
-- **签到奖励金额格式**：AgentRouter 的日志是 `每日签到成功，增加额度 $0.01 额度`，脚本先按这个格式解析；MyAPI 未用真实账号跑过，脚本里额外加了一个分支——如果本站返回的是原始额度数字（例如 `增加额度 5000 额度`），会按 `quota_per_unit=500000` 换算成美元显示；两种都匹配不上时，通知会原样贴出日志内容的前 60 字，并提示到网站核对，但签到本身仍算已确认。
-- **日志类型**：脚本按 New-API 通用的 `type=4` 找签到记录。如果 MyAPI 的签到记录用了别的 type，首次运行会报「未找到今日签到记录」，到时把网站使用日志里那条签到记录的 type 告诉我，我改一行就行。
-- **登录接口本身已验证**：用假账号实测 `POST /api/user/login`，服务器正常返回 JSON（`success:false`），接口、请求头、JSON 解析都没问题；只是没有真实账号，无法验证登录成功后的完整链路。
+- **真实账号的完整链路**：新流程是按 New-API v1.0.0-rc.x 的源码（`controller/user.go` 的 `writeLoginResponse`、`controller/checkin.go`、`model/checkin.go`）写的，并用模拟的新版接口响应做了两轮测试——未签到时 POST 签到成功、已签到时直接确认不重复 POST、假账号登录失败——三条分支都通过了。但没有真实账号，无法在 MyAPI 真站上跑通登录成功后的完整链路。第一次用真账号跑如果还显示“待确认”，请把通知原文发我，我再改。
+- **签到奖励金额**：`POST /api/user/checkin` 直接返回 `quota_awarded`（原始额度整数），脚本按 `quota_per_unit=500000` 换算成美元显示，例如 5000 额度显示为 +$0.01。这个换算逻辑与余额显示一致，奖励数值本身来自接口，不用再猜日志格式。
 
 ## 调试
 

@@ -4,17 +4,33 @@
  * 目标站：https://myapi.286600.xyz
  * （New-API v1.0.0-rc.36，/api/status 已验证：checkin_enabled=true，
  *  display_in_currency=true，quota_per_unit=500000，password_login_enabled=true，
- *  github_oauth=false，linuxdo_oauth=false，仅 NODELOC 第三方登录）
+ *  github_oauth=false，linuxdo_oauth=false，仅 NODELOC 第三方登录，
+ *  turnstile_check=false）
  *
- * 原理：与 AgentRouter 相同，都是 New-API。登录即签到：
+ * 原理（新版 New-API v1.0.0-rc.x，与 AgentRouter 老版本不同）：
  *   POST /api/user/login {username, password}
- *     -> data.id、data.checked_in、Set-Cookie: session=...
- *   GET  /api/user/self   （Cookie: session=...，New-API-User: <id>）
+ *     -> data: {access_token, token_type, access_expires_at, session,
+ *               user: {id, username, quota, used_quota, request_count, ...}}
+ *     注意：新版登录不再返回顶层 data.id / data.checked_in，
+ *     也不再发 session Cookie，改发 Bearer access_token。
+ *     （旧脚本按老版本写，才报“登录响应缺少 Cookie 或用户编号”。）
+ *   之后所有请求带：
+ *     Authorization: Bearer <access_token>
+ *     New-API-User: <user_id>
+ *   GET  /api/user/self
  *     -> data.quota、data.used_quota、data.request_count
- *   GET  /api/log/self?p=1&page_size=20
- *     -> 找当天 type=4、内容含“签到成功”的记录，确认奖励
- *   GET  /api/status
- *     -> display_in_currency / quota_per_unit，用于把额度换算成美元
+ *   GET  /api/user/checkin?month=YYYY-MM
+ *     -> data: {enabled, min_quota, max_quota,
+ *               stats: {total_quota, total_checkins, checkin_count,
+ *                       checked_in_today, records: [{checkin_date, quota_awarded}]}}
+ *   POST /api/user/checkin
+ *     -> 成功：data: {quota_awarded, checkin_date}，message "Check-in successful"
+ *     -> 今日已签过：success=false，message "Already checked in today"
+ *     （登录本身不再自动签到，必须显式调这个接口；本站 turnstile 已关，
+ *     不需要 Turnstile 票据。）
+ *
+ * 流程：登录 → 查余额 → 查今日签到状态 → 未签到则 POST 签到 → 再查一次余额。
+ * 今天已签到过时不重复 POST，直接按状态接口确认并显示今日奖励。
  *
  * 账号填写（三选一，优先 $argument）：
  *   1. Surge 模块参数（推荐）：myapi.sgmodule 里用 #!arguments 声明了
@@ -42,16 +58,18 @@
  * 改编自：MaYIHEI paperclip app/agentrouter
  *   https://github.com/MaYIHEI/paperclip/tree/main/app/agentrouter
  *   原作者 @773075692，改编者 MaYIHEI
- * 本版改编：Muse，按 https://myapi.286600.xyz 的 /api/status 适配
+ * 本版改编：Muse，按 https://myapi.286600.xyz 的 /api/status 适配，
+ * 并按 New-API v1.0.0-rc.x 的源码（controller/user.go 的 writeLoginResponse、
+ * controller/checkin.go、model/checkin.go）重写了登录与签到流程。
  *
  * ===== Surge =====
  * [Script]
- * MyAPI签到 = type=cron,cronexp="0 9 * * *",timeout=60,script-path=https://raw.githubusercontent.com/你的仓库/myapi.js,argument=username=你的账号&password=你的密码
+ * MyAPI签到 = type=cron,cronexp="0 9 * * *",timeout=60,script-path=https://raw.githubusercontent.com/JiuYueQingCheng/myapi-surge-checkin/main/myapi.js,argument=username=你的账号&password=你的密码
  * 也可以直接用随附的 myapi.sgmodule 导入 Surge（见 README.md）。
  *
  * ===== Loon / Quantumult X / Stash =====
- * 与 AgentRouter 原脚本用法相同，把 BASE_URL 和键名换成本文件即可，
- * Loon 的 $argument 是对象，Quantumult X / Stash 用 BoxJS 填账号。
+ * 与 AgentRouter 原脚本用法相同，Loon 的 $argument 是对象，
+ * Quantumult X / Stash 用 BoxJS 填账号。
  */
 
 const $ = new Env("MyAPI");
@@ -61,7 +79,7 @@ $.merge = typeof $argument === "object" && !!$argument && $argument.merge === tr
 
 if ($.merge) $.msg = (...a) => console.log(a.filter((x) => typeof x === "string" && x).join("\n"));
 
-const SCRIPT_VERSION = "2026-11-25.r1";
+const SCRIPT_VERSION = "2026-11-25.r2";
 
 $.log(`[INFO] 脚本版本 ${SCRIPT_VERSION}`);
 
@@ -224,6 +242,25 @@ function readAccounts() {
     return username && password ? [{ username, password }] : [];
 }
 
+function parseUserId(value) {
+    if (Number.isInteger(value) && value > 0) return value;
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+        const n = Number(value.trim());
+        if (Number.isInteger(n) && n > 0) return n;
+    }
+    return null;
+}
+
+function monthString(now) {
+    const d = new Date(now);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function dateString(now) {
+    const d = new Date(now);
+    return `${monthString(now)}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 async function checkin({ username, password }, quotaUnit) {
     const headers = {
         "User-Agent": UA,
@@ -233,11 +270,7 @@ async function checkin({ username, password }, quotaUnit) {
         Referer: `${BASE_URL}/login`,
     };
 
-    const loginStarted = Math.floor(Date.now() / 1000);
-
     const login = await request("POST", "/api/user/login", headers, JSON.stringify({ username, password }), "登录");
-
-    const loginFinished = Math.floor(Date.now() / 1000);
 
     if (login.json.success !== true) {
         return { title: "❌ 登录失败", content: `请先在 MyAPI 网页确认账号、密码及是否需要验证码，再更新 ${SETTINGS_PAGE}` };
@@ -246,80 +279,132 @@ async function checkin({ username, password }, quotaUnit) {
     const data = login.json.data;
 
     if (!data || typeof data !== "object" || Array.isArray(data)) {
-        return { title: "⚠️ 签到待确认", content: "登录成功，但响应缺少用户信息，请到网站使用日志中核对" };
+        return { title: "⚠️ 签到待确认", content: "登录成功，但响应缺少用户信息，请到网站核对签到记录与余额" };
     }
 
-    debug(`登录成功；checked_in=${data.checked_in === true ? "true" : data.checked_in === false ? "false" : "缺失或格式异常"}`);
-
+    // 新版登录：data.user.id + data.access_token；
+    // 老版本兼容：data.id + Set-Cookie: session=...
+    const loginUser = data.user && typeof data.user === "object" && !Array.isArray(data.user) ? data.user : data;
+    let userId = parseUserId(loginUser.id);
+    const accessToken = typeof data.access_token === "string" && data.access_token ? data.access_token : "";
     const cookie = sessionCookie(login.headers);
 
-    if (!cookie || !Number.isInteger(data.id) || data.id <= 0) {
-        return { title: "⚠️ 签到待确认", content: "登录响应缺少 Cookie 或用户编号，请到网站核对签到记录与余额" };
+    debug(`登录成功；auth=${accessToken ? "Bearer" : cookie ? "Cookie" : "无"}；userId=${userId === null ? "缺失" : "已取得"}`);
+
+    if (!accessToken && !cookie) {
+        return { title: "⚠️ 签到待确认", content: "登录成功，但响应里既没有访问令牌也没有 Cookie，无法继续查询，请到网站核对" };
     }
 
-    const userHeaders = {
+    // 新版用 Bearer + New-API-User；老版本用 Cookie。
+    // Surge 的 $httpClient 默认会自动管理 Cookie，所以只在非 Surge 下手动带 Cookie。
+    const authHeaders = {
         ...headers,
         Referer: `${BASE_URL}/console`,
-        Cookie: cookie,
-        "New-API-User": String(data.id),
     };
+    if (accessToken) authHeaders["Authorization"] = `Bearer ${accessToken}`;
+    if (userId !== null) authHeaders["New-API-User"] = String(userId);
+    if (cookie && !$.isSurge()) authHeaders["Cookie"] = cookie;
 
-    let stats, balance;
-
+    // 1. 查余额（顺便从这里补 userId：登录没给时，self 接口会返回 id）
+    let stats = "";
+    let balance;
     try {
-        const profile = await request("GET", "/api/user/self", userHeaders, undefined, "余额查询");
-        const quota = profile.json.data && profile.json.data.quota;
-
-        if (profile.json.success !== true || typeof quota !== "number" || !Number.isFinite(quota)) {
-            throw new Error("余额查询未返回有效额度，请到网站核对");
-        }
-
-        const user = profile.json.data;
-        stats = `${formatAmount("💳 当前余额", quota, quotaUnit)}\n${formatAmount("📉 累计消耗", user.used_quota, quotaUnit)}`;
-        balance = quotaUnit === null ? `额度 ${quota}` : `余额 $${(quota / quotaUnit).toFixed(2)}`;
-
-        if (Number.isInteger(user.request_count) && user.request_count >= 0) {
-            stats += `\n⚡ 累计调用：${user.request_count} 次`;
+        const profile = await fetchProfile(authHeaders, quotaUnit);
+        stats = profile.stats;
+        balance = profile.balance;
+        if (userId === null && profile.userId !== null) {
+            userId = profile.userId;
+            authHeaders["New-API-User"] = String(userId);
         }
     } catch (error) {
         stats = `💳 当前余额：查询失败\n📉 累计消耗：查询失败\n${error.message}`;
     }
 
-    let checkinRecord = null;
-    let detail;
-
+    // 2. 查今日签到状态
+    const today = dateString(Date.now());
+    let checkinStatus = null;
+    let statusError = "";
     try {
-        const logs = await request("GET", "/api/log/self?p=1&page_size=20", {
-            ...userHeaders,
-            Referer: `${BASE_URL}/console/log`,
-        }, undefined, "签到记录查询");
-
-        if (logs.json.success !== true || !logs.json.data || !Array.isArray(logs.json.data.items)) {
-            throw new Error("签到记录查询未成功，请在网站使用日志中核对");
+        const statusRes = await request("GET", `/api/user/checkin?month=${monthString(Date.now())}`, authHeaders, undefined, "签到状态查询");
+        if (statusRes.json.success !== true || !statusRes.json.data || typeof statusRes.json.data !== "object") {
+            throw new Error("签到状态查询未成功，请在网站核对");
         }
-
-        const items = logs.json.data.items;
-        checkinRecord = findTodayCheckin(items, Date.now());
-        debug(`最近记录数=${items.length}；今日签到记录=${!!checkinRecord}`);
-
-        if (!checkinRecord) detail = "最近 20 条日志中未找到今日签到记录，请到网站核对";
+        checkinStatus = statusRes.json.data;
+        debug(`签到状态：enabled=${checkinStatus.enabled}；今日已签=${checkinStatus.stats && checkinStatus.stats.checked_in_today}`);
     } catch (error) {
-        detail = error.message;
+        statusError = error.message;
+        debug(`签到状态查询失败：${statusError}`);
     }
 
-    if (checkinRecord) {
-        const time = new Date(checkinRecord.created_at * 1000);
-        const clock = [time.getHours(), time.getMinutes(), time.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
-
-        // 新增标记与本次登录期间的记录同时成立，才将奖励归于本次运行。
-        const isNew = data.checked_in === true && checkinRecord.created_at >= loginStarted && checkinRecord.created_at <= loginFinished;
-        const reward = formatCheckinReward(checkinRecord.content, isNew, quotaUnit);
-
-        return { title: "✅ 今日签到已确认", content: `${reward}\n${stats}\n🕒 签到时间：${clock}`, balance };
-    } else {
-        const state = data.checked_in === true ? "服务端返回已签到，但日志尚未确认" : "登录成功，签到状态尚未确认";
-        return { title: "⚠️ 签到待确认", content: `🎁 签到奖励：待确认\n${stats}\n\n${state}\n${detail}`, balance };
+    // 3. 今天已签到过：直接确认，不重复 POST
+    if (checkinStatus && checkinStatus.stats && checkinStatus.stats.checked_in_today === true) {
+        const record = findTodayRecord(checkinStatus.stats.records, today);
+        const reward = record
+            ? formatQuotaReward(record.quota_awarded, quotaUnit, false)
+            : "🎁 今日奖励：已签到（今日记录未返回，请到网站核对）";
+        return { title: "✅ 今日签到已确认", content: `${reward}\n${stats}\n🕒 签到日期：${today}（今日已签到）`, balance };
     }
+
+    // 签到功能未开启时，状态接口会直接报 enabled=false
+    if (checkinStatus && checkinStatus.enabled === false) {
+        return { title: "⚠️ 签到待确认", content: `🎁 签到奖励：待确认\n${stats}\n\n本站签到功能未开启\n${statusError}`, balance };
+    }
+
+    // 4. 未签到：POST 签到
+    let doRes;
+    try {
+        doRes = await request("POST", "/api/user/checkin", authHeaders, undefined, "签到");
+    } catch (error) {
+        return { title: "⚠️ 签到待确认", content: `🎁 签到奖励：待确认\n${stats}\n\n签到请求失败\n${error.message}`, balance };
+    }
+
+    if (doRes.json.success === true && doRes.json.data && typeof doRes.json.data === "object") {
+        const awarded = doRes.json.data.quota_awarded;
+        const checkinDate = doRes.json.data.checkin_date || today;
+        // 奖励已入账，重新查一次余额
+        try {
+            const profile = await fetchProfile(authHeaders, quotaUnit);
+            stats = profile.stats;
+            balance = profile.balance;
+        } catch (_) {
+            debug("签到后余额刷新失败，沿用签到前余额");
+        }
+        return { title: "✅ 今日签到已确认", content: `${formatQuotaReward(awarded, quotaUnit, true)}\n${stats}\n🕒 签到日期：${checkinDate}`, balance };
+    }
+
+    // 今日已签过（竞态：状态查询时还没签，POST 时已签）
+    const message = typeof doRes.json.message === "string" ? doRes.json.message : "";
+    if (/Already checked in/i.test(message)) {
+        try {
+            const again = await request("GET", `/api/user/checkin?month=${monthString(Date.now())}`, authHeaders, undefined, "签到状态复查");
+            if (again.json.success === true && again.json.data && again.json.data.stats && again.json.data.stats.checked_in_today === true) {
+                const record = findTodayRecord(again.json.data.stats.records, today);
+                const reward = record
+                    ? formatQuotaReward(record.quota_awarded, quotaUnit, false)
+                    : "🎁 今日奖励：已签到（今日记录未返回，请到网站核对）";
+                return { title: "✅ 今日签到已确认", content: `${reward}\n${stats}\n🕒 签到日期：${today}（今日已签到）`, balance };
+            }
+        } catch (_) {}
+        return { title: "✅ 今日签到已确认", content: `🎁 今日奖励：今日已签到\n${stats}\n🕒 签到日期：${today}`, balance };
+    }
+
+    return { title: "⚠️ 签到待确认", content: `🎁 签到奖励：待确认\n${stats}\n\n签到未成功：${message || "请到网站核对"}${statusError ? `\n${statusError}` : ""}`, balance };
+}
+
+async function fetchProfile(authHeaders, quotaUnit) {
+    const profile = await request("GET", "/api/user/self", authHeaders, undefined, "余额查询");
+    const user = profile.json.data;
+    const quota = user && user.quota;
+    if (profile.json.success !== true || typeof quota !== "number" || !Number.isFinite(quota)) {
+        throw new Error("余额查询未返回有效额度，请到网站核对");
+    }
+    const stats = `${formatAmount("💳 当前余额", quota, quotaUnit)}\n${formatAmount("📉 累计消耗", user.used_quota, quotaUnit)}`;
+    const balance = quotaUnit === null ? `额度 ${quota}` : `余额 $${(quota / quotaUnit).toFixed(2)}`;
+    let fullStats = stats;
+    if (Number.isInteger(user.request_count) && user.request_count >= 0) {
+        fullStats += `\n⚡ 累计调用：${user.request_count} 次`;
+    }
+    return { stats: fullStats, balance, userId: parseUserId(user.id) };
 }
 
 // 记录本次结果，供「签到汇总」：ok 正常 / cookie 需重新抓取 / fail 其他失败 / none 未使用
@@ -352,40 +437,22 @@ function formatAmount(label, value, quotaUnit) {
     return quotaUnit === null ? `${label}（原始额度）：${value}` : `${label}：$${(value / quotaUnit).toFixed(2)}`;
 }
 
-function formatCheckinReward(content, isNew, quotaUnit) {
-    // 系统日志的 quota 不是奖励；只解析实测详情中明确标注的美元金额
-    // （官网半角 $、全角 ＄ 都出现过）。
-    // MyAPI 的奖励格式未经实测确认：先按 AgentRouter 的格式解析，
-    // 若本站返回的是原始额度数字，再按 quota_per_unit 换算成美元。
-    const text = (content || "").trim();
-    const match = text.match(/^每日签到成功，\s*增加额度\s*[$＄]\s*(\d+(?:\.\d+)?)\s*额度$/);
-    const amount = match ? Number(match[1]) : NaN;
+// quota_awarded 是原始额度（整数），按 quota_per_unit 换算成美元显示。
+function formatQuotaReward(quotaAwarded, quotaUnit, isNew) {
     const label = isNew ? "🎁 本次奖励" : "🎁 今日奖励";
-    if (Number.isFinite(amount)) {
-        return `${label}：${amount > 0 ? "+" : ""}$${amount.toFixed(2)}${isNew ? "" : "（今日记录）"}`;
+    if (typeof quotaAwarded !== "number" || !Number.isFinite(quotaAwarded)) {
+        return `${label}：金额未识别，请到网站核对`;
     }
-    const rawMatch = text.match(/^每日签到成功，\s*增加额度\s*(\d+(?:\.\d+)?)\s*额度$/);
-    if (rawMatch && quotaUnit) {
-        const raw = Number(rawMatch[1]);
-        if (Number.isFinite(raw) && raw > 0) {
-            return `${label}：+$${(raw / quotaUnit).toFixed(2)}（原始额度 ${raw}）${isNew ? "" : "（今日记录）"}`;
-        }
-    }
-    return `${label}：金额未识别，请到网站核对（原始记录：${text.slice(0, 60)}）`;
+    if (quotaUnit === null) return `${label}：+${quotaAwarded} 额度${isNew ? "" : "（今日记录）"}`;
+    return `${label}：+$${(quotaAwarded / quotaUnit).toFixed(2)}（原始额度 ${quotaAwarded}）${isNew ? "" : "（今日记录）"}`;
 }
 
-function findTodayCheckin(items, now) {
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
-    let latest = null;
-    for (const item of items) {
-        if (item && item.type === 4
-            && typeof item.content === "string" && item.content.includes("签到成功")
-            && typeof item.created_at === "number" && Number.isFinite(item.created_at)
-            && item.created_at * 1000 >= start.getTime() && item.created_at * 1000 <= now
-            && (!latest || item.created_at > latest.created_at)) latest = item;
+function findTodayRecord(records, today) {
+    if (!Array.isArray(records)) return null;
+    for (const record of records) {
+        if (record && record.checkin_date === today && typeof record.quota_awarded === "number") return record;
     }
-    return latest;
+    return null;
 }
 
 function sessionCookie(headers) {
