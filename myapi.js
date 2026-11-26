@@ -64,7 +64,7 @@
  *
  * ===== Surge =====
  * [Script]
- * MyAPI签到 = type=cron,cronexp="0 9 * * *",timeout=60,script-path=https://raw.githubusercontent.com/JiuYueQingCheng/myapi-surge-checkin/main/myapi.js,argument=username=你的账号&password=你的密码
+ * MyAPI签到 = type=cron,cronexp="0 9 * * *",timeout=60,script-path=https://cdn.jsdelivr.net/gh/JiuYueQingCheng/myapi-surge-checkin@main/myapi.js,argument=username=你的账号&password=你的密码
  * 也可以直接用随附的 myapi.sgmodule 导入 Surge（见 README.md）。
  *
  * ===== Loon / Quantumult X / Stash =====

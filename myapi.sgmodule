@@ -7,7 +7,7 @@
 
 # 使用前必读（见 README.md）：
 # 1. 脚本地址已指向本仓库的 myapi.js：
-#    https://raw.githubusercontent.com/JiuYueQingCheng/myapi-surge-checkin/main/myapi.js
+#    https://cdn.jsdelivr.net/gh/JiuYueQingCheng/myapi-surge-checkin@main/myapi.js
 #    直接导入本模块即可，不用改 script-path。
 # 2. 账号密码和签到时间不在文件里填：导入模块后，在 Surge 模块列表里点开「MyAPI签到」→ 编辑参数，
 #    填 username（MyAPI 用户名或邮箱）、password（网站登录密码），
@@ -21,4 +21,4 @@
 # 或改用 BoxJS（填 myapi_username、myapi_password）。
 
 [Script]
-MyAPI签到 = type=cron,cronexp="{{{checkin_minute}}} {{{checkin_hour}}} * * *",script-path=https://raw.githubusercontent.com/JiuYueQingCheng/myapi-surge-checkin/main/myapi.js,argument=username={{{username}}}&password={{{password}}},timeout=60,wake-system=true
+MyAPI签到 = type=cron,cronexp="{{{checkin_minute}}} {{{checkin_hour}}} * * *",script-path=https://cdn.jsdelivr.net/gh/JiuYueQingCheng/myapi-surge-checkin@main/myapi.js,argument=username={{{username}}}&password={{{password}}},timeout=60,wake-system=true

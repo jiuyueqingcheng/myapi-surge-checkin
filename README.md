@@ -46,7 +46,7 @@ MyAPI 是新版 New-API（v1.0.0-rc.36），登录和签到方式与 AgentRouter
 
 脚本已托管在本仓库，地址为：
 
-`https://raw.githubusercontent.com/JiuYueQingCheng/myapi-surge-checkin/main/myapi.js`
+`https://cdn.jsdelivr.net/gh/JiuYueQingCheng/myapi-surge-checkin@main/myapi.js`
 
 `myapi.sgmodule` 里的 `script-path` 已指向该地址，直接导入模块即可，不用改。
 
